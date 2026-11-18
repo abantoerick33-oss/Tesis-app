@@ -1,14 +1,15 @@
-import os, json, random, re, sqlite3
+import os, json, random, re, sqlite3, time
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from pypdf import PdfReader
-import anthropic
+from groq import Groq, RateLimitError
 
 app = Flask(__name__)
 DB = "tesis.db"
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-MODELO = "claude-sonnet-5-5"
-MAX_SECCIONES = 15  # limita las llamadas a la IA al subir la tesis
+# Groq tiene plan gratis, sin tarjeta: https://console.groq.com
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+MODELO = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+TAM_SECCION = 4000  # caracteres por sección (pequeño para no pasar el límite gratis)
 
 
 def db():
@@ -20,7 +21,8 @@ def db():
 def init_db():
     with db() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS secciones(
-            id INTEGER PRIMARY KEY, texto TEXT)""")
+            id INTEGER PRIMARY KEY, texto TEXT,
+            procesada INTEGER DEFAULT 0)""")
         con.execute("""CREATE TABLE IF NOT EXISTS preguntas(
             id INTEGER PRIMARY KEY,
             texto TEXT,
@@ -31,9 +33,16 @@ def init_db():
 
 
 def pedir_ia(prompt):
-    r = client.messages.create(model=MODELO, max_tokens=800,
-        messages=[{"role": "user", "content": prompt}])
-    return r.content[0].text
+    # Si se pasa el límite gratis por minuto, espera y reintenta
+    for intento in range(3):
+        try:
+            r = client.chat.completions.create(
+                model=MODELO, max_completion_tokens=2000, reasoning_effort="low",
+                messages=[{"role": "user", "content": prompt}])
+            return r.choices[0].message.content
+        except RateLimitError:
+            time.sleep(20 * (intento + 1))
+    raise RuntimeError("La IA está ocupada, intenta en un minuto.")
 
 
 def leer_json(texto):
@@ -42,27 +51,39 @@ def leer_json(texto):
     return json.loads(m.group(1) if m else texto)
 
 
-# 1. Subir la tesis y generar preguntas
+# 1. Subir la tesis: solo se guarda en secciones (es instantáneo).
+#    Las preguntas se generan de a poco, una sección a la vez, para no
+#    pasar los límites del plan gratis de la IA.
 @app.post("/subir")
 def subir():
     pdf = PdfReader(request.files["tesis"])
     texto = "\n".join(p.extract_text() or "" for p in pdf.pages)
-    tam = max(4000, len(texto) // MAX_SECCIONES + 1)
-    trozos = [texto[i:i+tam] for i in range(0, len(texto), tam)]
-    ahora = datetime.now().isoformat()
-    total = 0
+    trozos = [texto[i:i+TAM_SECCION] for i in range(0, len(texto), TAM_SECCION)]
+    trozos = [t for t in trozos if len(t.strip()) > 300]
     with db() as con:
         for t in trozos:
-            sid = con.execute("INSERT INTO secciones(texto) VALUES(?)", (t,)).lastrowid
-            resp = pedir_ia(
-                "Eres jurado de tesis. Lee este fragmento y escribe 3 preguntas "
-                "difíciles que harías en la sustentación. Responde solo con una "
-                "lista JSON de strings.\n\n" + t)
-            for q in leer_json(resp):
-                con.execute("INSERT INTO preguntas(texto, seccion_id, proxima) VALUES(?,?,?)",
-                            (q, sid, ahora))
-                total += 1
-    return jsonify(ok=True, preguntas=total)
+            con.execute("INSERT INTO secciones(texto) VALUES(?)", (t,))
+    generar_preguntas()  # prepara las primeras preguntas
+    return jsonify(ok=True, secciones=len(trozos))
+
+
+def generar_preguntas():
+    """Toma una sección al azar que aún no tenga preguntas y crea 3."""
+    with db() as con:
+        sec = con.execute("SELECT * FROM secciones WHERE procesada=0 "
+                          "ORDER BY RANDOM() LIMIT 1").fetchone()
+        if not sec:
+            return False
+        resp = pedir_ia(
+            "Eres jurado de tesis. Lee este fragmento y escribe 3 preguntas "
+            "difíciles que harías en la sustentación, en español. Responde solo "
+            "con una lista JSON de strings.\n\n" + sec["texto"])
+        ahora = datetime.now().isoformat()
+        for q in leer_json(resp):
+            con.execute("INSERT INTO preguntas(texto, seccion_id, proxima) VALUES(?,?,?)",
+                        (q, sec["id"], ahora))
+        con.execute("UPDATE secciones SET procesada=1 WHERE id=?", (sec["id"],))
+    return True
 
 
 # 2. Agregar pregunta propia (del profesor)
@@ -81,6 +102,15 @@ def agregar_pregunta():
 @app.get("/siguiente")
 def siguiente():
     ahora = datetime.now().isoformat()
+    with db() as con:
+        pendientes = con.execute("SELECT COUNT(*) n FROM preguntas WHERE proxima <= ?",
+                                 (ahora,)).fetchone()["n"]
+    # Si quedan pocas preguntas pendientes, prepara más de otra parte de la tesis
+    if pendientes < 3:
+        try:
+            generar_preguntas()
+        except Exception:
+            pass
     with db() as con:
         filas = con.execute("SELECT * FROM preguntas WHERE proxima <= ? ORDER BY nivel",
                             (ahora,)).fetchall()

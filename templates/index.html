@@ -156,10 +156,10 @@ async function subirTesis() {
   const datos = new FormData();
   datos.append("tesis", f);
   $("btnSubir").disabled = true;
-  $("msgSubir").textContent = "Leyendo tu tesis y preparando preguntas… puede tardar unos minutos.";
+  $("msgSubir").textContent = "Leyendo tu tesis… espera unos segundos.";
   try {
     const r = await fetch("/subir", { method: "POST", body: datos }).then(r => r.json());
-    $("msgSubir").textContent = `¡Listo! Se generaron ${r.preguntas} preguntas.`;
+    $("msgSubir").textContent = `¡Listo! Tu tesis se dividió en ${r.secciones} partes. Las preguntas se irán creando de a poco mientras practicas.`;
     cargarPregunta();
   } catch (e) {
     $("msgSubir").textContent = "Hubo un error al procesar el PDF. Intenta de nuevo.";
